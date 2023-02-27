@@ -41,6 +41,6 @@ jobs:
           npm run docker-build
           # tag docker image so that the workflow knows where to push the image to
           # branch name and commit hash are appended for easy identification
-          docker tag dummy-node:latest ${{secrets.ECR_REPO_URI}}/${{secrets.ECR_REPO_NAME}}:${{env.branch_name}}-${{env.sha_short}}
-          docker push ${{secrets.ECR_REPO_URI}}/${{secrets.ECR_REPO_NAME}}:${{env.branch_name}}-${{env.sha_short}}
-          echo "name=image::${{secrets.ECR_REPO_URI}}/${{secrets.ECR_REPO_NAME}}:${{env.branch_name}}-${{env.sha_short}}" >> $GITHUB_OUTPUT
+          docker tag dummy-node:latest ${{secrets.ECR_REPO_URI}}:${{env.branch_name}}-${{env.sha_short}}
+          docker push ${{secrets.ECR_REPO_URI}}:${{env.branch_name}}-${{env.sha_short}}
+          echo "name=image::${{secrets.ECR_REPO_URI}}:${{env.branch_name}}-${{env.sha_short}}" >> $GITHUB_OUTPUT
