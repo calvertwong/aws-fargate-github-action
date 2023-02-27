@@ -1,0 +1,5 @@
+.github
+.history
+.git
+node_modules
+docker/.dockerignore
