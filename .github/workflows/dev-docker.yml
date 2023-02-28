@@ -43,6 +43,7 @@ jobs:
           # branch name and commit hash are appended for easy identification
           docker tag dummy-node:latest ${{secrets.ECR_REPO_URI}}:${{env.branch_name}}-${{env.sha_short}}
           docker push ${{secrets.ECR_REPO_URI}}:${{env.branch_name}}-${{env.sha_short}}
+          echo "image=${{secrets.ECR_REPO_URI}}:${{env.branch_name}}-${{env.sha_short}}" >> $GITHUB_OUTPUT
 
       - name: Fill in the new image ID in the Amazon ECS task definition
         id: task-def
