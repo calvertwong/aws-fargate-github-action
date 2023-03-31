@@ -1,4 +1,4 @@
-name: Prod-Docker-Deploy
+name: Prod-Docker-Pipeline
 
 on:
   push:
@@ -34,15 +34,31 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
-          aws-access-key-id: ${{ secrets.AWS_ECR_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_ECR_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ secrets.AWS_IAM_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_IAM_SECRET_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      # this should be called at all times
+      - name: Get old task definition ARN
+        id: old-task-def-arn
+        run: echo "old_task_def_arn=$(aws ecs list-task-definitions --family ${{ secrets.PROD_TASK_FAMILY_NAME }} --status ACTIVE --sort DESC --query 'taskDefinitionArns[0]')" >> $GITHUB_OUTPUT
+
+      # Note: this arn is different than the arn from name: Get old task definition ARN
+      - name: Get old running task definition private ipv4
+        id: get-old-task-def-private-ipv4
+        run: |
+          task_arn=$(aws ecs list-tasks --cluster ${{secrets.PROD_CLUSTER_NAME}} --query 'taskArns[0]')
+          no_quotes_task_arn=${task_arn//\"/}
+          echo "old_task_arn=${no_quotes_task_arn}" >> $GITHUB_OUTPUT
+          task_details=$(aws ecs describe-tasks --cluster ${{secrets.PROD_CLUSTER_NAME}} --tasks $no_quotes_task_arn --query 'tasks[0].attachments[0].details')
+          echo "old_task_def_private_ipv4=$(echo ${task_details} | jq -r '.[] | select(.name=="privateIPv4Address").value')" >> $GITHUB_OUTPUT
+      - name: Get old running task definition revision
+        id: get-old-task-def-revision
+        run: |
+          echo "old_task_def_revision=$(aws ecs describe-task-definition --task-definition ${{ steps.old-task-def-arn.outputs.old_task_def_arn }} --query 'taskDefinition.revision')" >> $GITHUB_OUTPUT
       - name: Build, tag and push image to Amazon ECR
         id: build-image-with-release-version
         if: ${{env.release_version}}
@@ -51,8 +67,9 @@ jobs:
           npm run docker-build
           # tag docker image so that the workflow knows where to push the image to
           # "prod", semver and commit hash are appended for easy identification
-          docker tag dummy-node:latest ${{secrets.ECR_REPO_URI}}:prod-${{env.release_version}}-${{env.sha_short}}
-          docker push ${{secrets.ECR_REPO_URI}}:prod-${{env.release_version}}-${{env.sha_short}}
+          docker tag image-name:latest ${{secrets.PROD_ECR_REPO_URI}}:prod-${{env.release_version}}-${{env.sha_short}}
+          docker push ${{secrets.PROD_ECR_REPO_URI}}:prod-${{env.release_version}}-${{env.sha_short}}
+          echo "new_docker_image_name=${{secrets.PROD_ECR_REPO_URI}}:prod-${{env.release_version}}-${{env.sha_short}}" >> $GITHUB_OUTPUT
       # this is a fallback step just in case semver is invalid, all pushes should be done through a pull request from a releases branch
       - name: Build, tag and push image to Amazon ECR (Invalid Release Version, needs attention)
         id: build-image-without-release-version-for-just-in-case
@@ -62,5 +79,89 @@ jobs:
           npm run docker-build
           # tag docker image so that the workflow knows where to push the image to
           # "prod" and commit hash are appended for easy identification
-          docker tag dummy-node:latest ${{secrets.ECR_REPO_URI}}:prod-${{env.sha_short}}
-          docker push ${{secrets.ECR_REPO_URI}}:prod-${{env.sha_short}}
+          docker tag image-name:latest ${{secrets.PROD_ECR_REPO_URI}}:prod-${{env.sha_short}}
+          docker push ${{secrets.PROD_ECR_REPO_URI}}:prod-${{env.sha_short}}
+          echo "new_docker_image_name_no_semver=${{secrets.PROD_ECR_REPO_URI}}:prod-${{env.sha_short}}" >> $GITHUB_OUTPUT
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition ${{secrets.PROD_TASK_FAMILY_NAME}} --query taskDefinition > task-definition.json
+      # Execute this if semver is available
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        if: ${{env.release_version}}
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ secrets.PROD_CONTAINER_NAME }}
+          image: ${{ steps.build-image-with-release-version.outputs.new_docker_image_name }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        if: ${{env.release_version}}
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ secrets.PROD_SERVICE_NAME }}
+          cluster: ${{secrets.PROD_CLUSTER_NAME}}
+          wait-for-service-stability: false
+
+      # Execute this if semver is not available
+      - name: Fill in the new image ID in the Amazon ECS task definition no semver
+        id: task-def-no-semver
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        if: ${{!env.release_version}}
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ secrets.PROD_CONTAINER_NAME }}
+          image: ${{ steps.build-image-without-release-version-for-just-in-case.outputs.new_docker_image_name_no_semver }}
+
+      - name: Deploy Amazon ECS task definition no semver
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        if: ${{!env.release_version}}
+        with:
+          task-definition: ${{ steps.task-def-no-semver.outputs.task-definition }}
+          service: ${{ secrets.PROD_SERVICE_NAME }}
+          cluster: ${{secrets.PROD_CLUSTER_NAME}}
+          wait-for-service-stability: false
+
+      - name: Get new task definition ARN
+        id: new-task-def-arn
+        run: |
+          echo "new_task_def_arn=$(aws ecs list-task-definitions --family ${{ secrets.PROD_TASK_FAMILY_NAME }} --status ACTIVE --sort DESC --query 'taskDefinitionArns[0]')" >> $GITHUB_OUTPUT
+      - name: Update cluster service
+        run: |
+          echo "$(aws ecs update-service --cluster ${{secrets.PROD_CLUSTER_NAME}} --service ${{secrets.PROD_SERVICE_NAME}} --task-definition ${{ steps.new-task-def-arn.outputs.new_task_def_arn }})" >> deleteMe.txt
+      - name: Stop old revision of task in cluster
+        run: |
+          echo "$(aws ecs stop-task --cluster ${{secrets.PROD_CLUSTER_NAME}} --task ${{ steps.get-old-task-def-private-ipv4.outputs.old_task_arn }})" >> deleteMe.txt
+      - name: Get new running task definition private ipv4
+        id: get-new-task-def-private-ipv4
+        run: |
+          # A new cluster task will be started but the task arn won't be accessible at this step yet
+          task_arn=$(aws ecs list-tasks --cluster ${{secrets.PROD_CLUSTER_NAME}} --query 'taskArns[0]')
+          # Wait until the task is ready
+          while [ $task_arn == null ]; do
+            sleep 5
+            task_arn=$(aws ecs list-tasks --cluster ${{secrets.PROD_CLUSTER_NAME}} --query 'taskArns[0]')
+          done
+          # Remove double quotes from value
+          no_quotes_task_arn=${task_arn//\"/}
+          status="PENDING"
+          while [ $status != "RUNNING" ]; do
+            status=$(aws ecs describe-tasks --cluster ${{secrets.PROD_CLUSTER_NAME}} --tasks $no_quotes_task_arn | jq -r '.tasks[].lastStatus')
+            sleep 5
+          done
+          task_details=$(aws ecs describe-tasks --cluster ${{secrets.PROD_CLUSTER_NAME}} --tasks $no_quotes_task_arn --query 'tasks[0].attachments[0].details')
+          new_task_def_private_ipv4=$(echo ${task_details} | jq -r '.[] | select(.name=="privateIPv4Address").value')
+          echo "new_task_def_private_ipv4=$(echo ${task_details} | jq -r '.[] | select(.name=="privateIPv4Address").value')" >> $GITHUB_OUTPUT
+      - name: Register new target group with the new cluster task
+        run: |
+          aws elbv2 register-targets --target-group-arn ${{secrets.PROD_TARGET_GROUP_ARN}} --targets Id=${{ steps.get-new-task-def-private-ipv4.outputs.new_task_def_private_ipv4 }}
+      - name: Deregister old target group
+        run: |
+          aws elbv2 deregister-targets --target-group-arn ${{secrets.PROD_TARGET_GROUP_ARN}} --targets Id=${{steps.get-old-task-def-private-ipv4.outputs.old_task_def_private_ipv4}}
+      - name: Deregister old task definition from task definition page
+        run: |
+          echo "$(aws ecs deregister-task-definition --task-definition ${{ secrets.PROD_TASK_FAMILY_NAME }}:${{ steps.get-old-task-def-revision.outputs.old_task_def_revision }})" >> deleteMe.txt
+          echo "$(aws ecs delete-task-definitions --task-definition ${{ steps.old-task-def-arn.outputs.old_task_def_arn }})" >> deleteMe.txt
+      - name: Delete deleteMe.txt
+        run: rm deleteMe.txt
